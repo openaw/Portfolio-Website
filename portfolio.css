@@ -1,0 +1,142 @@
+html,
+body {
+  position: absolute;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  touch-action: none;
+  content-zooming: none;
+}
+
+/* Make UI text invisible but still clickable */
+.menuItem,
+.headerTitle,
+.backBtn {
+  opacity: 0;
+  pointer-events: auto;
+}
+
+/* Canvas stays visual-only so UI is clickable */
+canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  pointer-events: none;
+}
+
+/* UI overlay */
+.ui {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 2;
+  pointer-events: none; /* enable only on controls below */
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+
+/* Menu */
+.menu {
+  display: grid;
+  gap: 18px;
+  pointer-events: auto;
+}
+
+.menuItem {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 800;
+  font-size: clamp(28px, 6vw, 64px);
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  padding: 6px 10px;
+  line-height: 1;
+}
+
+.menuItem:hover {
+  color: rgba(255, 255, 255, 1);
+}
+
+/* Header (hidden until a section is opened) */
+.header {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 22px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+
+  opacity: 0;
+  transform: translateY(-18px);
+  transition: opacity 420ms ease, transform 520ms ease;
+  pointer-events: none;
+}
+
+.headerTitle {
+  color: rgba(255, 255, 255, 0.95);
+  font-weight: 900;
+  font-size: clamp(28px, 5vw, 56px);
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+
+/* Back button (positioned by JS) */
+.backBtn {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 0; /* JS sets exact top */
+
+  pointer-events: auto;
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(0, 0, 0, 0.25);
+  color: rgba(255, 255, 255, 0.9);
+  padding: 10px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 650;
+  backdrop-filter: blur(6px);
+}
+
+.backBtn:hover {
+  border-color: rgba(255, 255, 255, 0.4);
+  color: rgba(255, 255, 255, 1);
+}
+
+/* Section mode toggles */
+.ui.section-open .menu {
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: opacity 320ms ease, transform 520ms ease;
+  pointer-events: none;
+}
+
+.ui.section-open .header {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: none; /* title isn't clickable, back button is */
+}
+
+.ui:not(.section-open) .menu {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 320ms ease, transform 520ms ease;
+}
+
+.ui.section-open .menu {
+  pointer-events: none;
+}
+.ui.section-open .backBtn {
+  pointer-events: auto;
+}

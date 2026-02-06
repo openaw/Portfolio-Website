@@ -1,11 +1,10 @@
 "use strict";
 
 /**
- * Optimized rewrite:
- * - Reuses a single offscreen canvas for text rasterization (no new canvas each call)
- * - Raster targets stored as a flat number array: [x0,y0,x1,y1,...] (no {x,y} objects)
- * - Downsampling avoids extra arrays where possible
- * - Less per-frame overhead; keeps identical UI/interaction behavior
+ * Adds "speed-based" size + brightness for BACKGROUND particles:
+ * - packed layout becomes [x, y, size, type+hover, speed01]
+ * - bg particles compute speed01 from frame-to-frame velocity (smoothed)
+ * - shader boosts bg alpha by speed01 (subtle)
  */
 (() => {
   // =========================
@@ -47,6 +46,25 @@
   const TEXT_POINT_HOVER = 1.70;
 
   // =========================
+  // Mouse interaction
+  // =========================
+  const INTERACT_RADIUS_BG = 25;
+  const INTERACT_RADIUS_TEXT = 60;
+
+  const MAX_PUSH_BG = 2.2;
+  const MAX_PUSH_TEXT = 1.6;
+
+  const HOVER_LERP = 0.12;
+
+  // =========================
+  // NEW: speed → size/brightness mapping (bg only)
+  // =========================
+  const BG_SPEED_REF_PX_PER_FRAME = 0.01; // speed that maps to ~1.0 (tweak)
+  const BG_SPEED_SMOOTH = 0.18;          // 0..1; higher = snappier
+  const BG_SPEED_SIZE_BOOST = 3;      // size multiplier at speed01=1
+  const BG_SPEED_ALPHA_BOOST = 0.5;     // alpha multiplier amount at speed01=1
+
+  // =========================
   // DOM / content
   // =========================
   const ui = document.querySelector(".ui");
@@ -83,11 +101,16 @@
     },
     links: {
       title: "links",
-      body: ["GitHub: https://github.com/openaw", "LinkedIn: https://www.linkedin.com/in/oliver-green-5431a7329/", "Email: seito.green@gmail.com", "Not clickable yet"].join("\n"),
+      body: [
+        "GitHub: https://github.com/openaw",
+        "LinkedIn: https://www.linkedin.com/in/oliver-green-5431a7329/",
+        "Email: seito.green@gmail.com",
+        "Not clickable yet",
+      ].join("\n"),
     },
   };
 
-  let state = "menu"; // "menu" | "section"
+  let state = "menu";
   let activeKey = "about";
 
   function syncMenuInteractivity() {
@@ -116,6 +139,7 @@
     uResolution: null,
     uBgAlpha: null,
     uTextAlpha: null,
+    uBgSpeedAlphaBoost: null,
 
     init(options) {
       this.elem = document.querySelector("canvas");
@@ -133,13 +157,19 @@
         `
         precision highp float;
 
-        attribute vec4 aPosition; // x,y,size,typeAlphaFlag(0=bg,1=text)
+        // NOTE: aPosition is still vec4, but now the buffer is interleaved with an extra float (aSpeed)
+        attribute vec4 aPosition; // x,y,size,type+hover
+        attribute float aSpeed;   // speed01 (bg only)
+
         uniform vec2 uResolution;
 
-        varying float vAlphaType;
+        varying float vTypeHover;
+        varying float vSpeed;
 
         void main() {
-          vAlphaType = aPosition.w;
+          vTypeHover = aPosition.w;
+          vSpeed = aSpeed;
+
           gl_PointSize = max(1.0, min(18.0, aPosition.z));
           gl_Position = vec4(
             ( aPosition.x / uResolution.x * 2.0) - 1.0,
@@ -160,8 +190,10 @@
 
         uniform float uBgAlpha;
         uniform float uTextAlpha;
+        uniform float uBgSpeedAlphaBoost; // NEW
 
-        varying float vAlphaType;
+        varying float vTypeHover;
+        varying float vSpeed;
 
         void main() {
           vec2 p = gl_PointCoord - vec2(0.5);
@@ -173,9 +205,22 @@
           float rim = smoothstep(0.48, 0.40, r) - smoothstep(0.40, 0.32, r);
           rim = clamp(rim, 0.0, 1.0);
 
-          float baseAlpha = mix(uBgAlpha, uTextAlpha, step(0.5, vAlphaType));
-          float a = baseAlpha * (0.90 * core + 0.22 * rim);
+          float isText = step(0.5, vTypeHover);
 
+          // decode hover from w:
+          float hover = (isText > 0.5) ? (vTypeHover - 0.5) / 0.49 : vTypeHover / 0.49;
+          hover = clamp(hover, 0.0, 1.0);
+
+          float baseAlpha = mix(uBgAlpha, uTextAlpha, isText);
+
+          // brighten on hover
+          float boosted = baseAlpha * (1.0 + hover * 0.75);
+
+          // NEW: speed-based alpha boost for BG only (subtle)
+          float speedBoost = mix(1.0 + clamp(vSpeed, 0.0, 1.0) * uBgSpeedAlphaBoost, 1.0, isText);
+          boosted *= speedBoost;
+
+          float a = boosted * (0.90 * core + 0.22 * rim);
           gl_FragColor = vec4(1.0, 0.85, 0.25, a);
         }
       `
@@ -191,6 +236,7 @@
       this.uResolution = gl.getUniformLocation(program, "uResolution");
       this.uBgAlpha = gl.getUniformLocation(program, "uBgAlpha");
       this.uTextAlpha = gl.getUniformLocation(program, "uTextAlpha");
+      this.uBgSpeedAlphaBoost = gl.getUniformLocation(program, "uBgSpeedAlphaBoost");
 
       return gl;
     },
@@ -230,16 +276,23 @@
   // =========================
   // Particle system
   // =========================
-  const packed = new Float32Array(N_PARTICLES * 4); // x,y,size,type
+  // NEW: 5 floats per particle: x,y,size,type+hover,speed01
+  const STRIDE = 5;
+  const packed = new Float32Array(N_PARTICLES * STRIDE);
   const particles = new Array(N_PARTICLES);
+
+  function influence(dist, radius) {
+    const t = 1 - Math.max(0, Math.min(1, dist / radius));
+    return t * t * (3 - 2 * t);
+  }
 
   class Particle {
     constructor(i, gx, gy, packedArray) {
       this.gx = gx;
       this.gy = gy;
 
-      const base = i * 4;
-      this.p = packedArray.subarray(base, base + 4);
+      const base = i * STRIDE;
+      this.p = packedArray.subarray(base, base + STRIDE);
 
       this.x = 0;
       this.y = 0;
@@ -249,7 +302,7 @@
       this.ax = 0;
       this.ay = 0;
 
-      this.mode = "bg"; // "bg" | "text"
+      this.mode = "bg";
       this.v = 1;
       this.vt = 1;
 
@@ -257,6 +310,15 @@
       this.speed = 0.55 + Math.random() * 0.65;
       this.ampX = 0.25 + Math.random() * 0.45;
       this.ampY = 0.25 + Math.random() * 0.45;
+
+      // hover
+      this.hover = 0;
+      this.hoverT = 0;
+
+      // NEW: velocity tracking (for bg speed glow)
+      this.prevX = 0;
+      this.prevY = 0;
+      this.spd01 = 0;
 
       this.setBGTarget(true);
     }
@@ -278,7 +340,8 @@
       this.ax = a.x;
       this.ay = a.y;
 
-      this.p[3] = 0.0;
+      this.p[3] = 0.0 + this.hover * 0.49; // type+hover
+      this.p[4] = this.spd01;              // speed01
       if (immediate) this.snapToAnchor();
     }
 
@@ -289,18 +352,21 @@
       this.ax = x;
       this.ay = y;
 
-      this.p[3] = 1.0;
+      this.p[3] = 0.5 + this.hover * 0.49;
+      this.p[4] = 0.0; // speed not used for text
       if (immediate) this.snapToAnchor();
     }
 
     setFadeOutToBG() {
       this.vt = 0;
       this.mode = "text";
-      this.p[3] = 1.0;
 
       const a = this.bgAnchorForGrid(tmpXY);
       this.ax = a.x;
       this.ay = a.y;
+
+      this.p[3] = 0.5 + this.hover * 0.49;
+      this.p[4] = 0.0;
     }
 
     snapToAnchor() {
@@ -308,6 +374,11 @@
       this.y0 = this.ay;
       this.x = this.x0;
       this.y = this.y0;
+
+      // reset velocity baseline
+      this.prevX = this.x;
+      this.prevY = this.y;
+
       this.p[0] = this.x;
       this.p[1] = this.y;
     }
@@ -329,37 +400,81 @@
 
       const dx = pointer.x - this.x;
       const dy = pointer.y - this.y;
-      const d = Math.sqrt(dx * dx + dy * dy) + 0.0001;
+      const d = Math.sqrt(dx * dx + dy * dy) + 1e-4;
 
       if (this.mode === "text") {
-        const s = Math.min(1.05, TXT_REPEL_STRENGTH / d);
+        const inf = influence(d, INTERACT_RADIUS_TEXT);
+        this.hoverT = inf;
 
-        this.x += -s * (dx / d) + (tx0 - this.x) * TXT_SPRING;
-        this.y += -s * (dy / d) + (ty0 - this.y) * TXT_SPRING;
+        const inv = 1.0 / d;
+        let push = TXT_REPEL_STRENGTH * inf;
+        if (push > MAX_PUSH_TEXT) push = MAX_PUSH_TEXT;
+
+        const px = -push * dx * inv;
+        const py = -push * dy * inv;
+
+        this.x += px + (tx0 - this.x) * TXT_SPRING;
+        this.y += py + (ty0 - this.y) * TXT_SPRING;
 
         const ox = this.x - tx0;
         const oy = this.y - ty0;
-        const od = Math.sqrt(ox * ox + oy * oy) + 0.0001;
+        const od = Math.sqrt(ox * ox + oy * oy) + 1e-4;
         if (od > TXT_MAX_DISPLACEMENT) {
           const m = TXT_MAX_DISPLACEMENT / od;
           this.x = tx0 + ox * m;
           this.y = ty0 + oy * m;
         }
 
-        const size = TEXT_POINT_BASE + TEXT_POINT_HOVER * (1.0 / (1.0 + d * 0.030));
+        const size = TEXT_POINT_BASE + TEXT_POINT_HOVER * inf;
         this.p[2] = size * Math.max(0.0, this.v);
-      } else {
-        const s = BG_REPEL_STRENGTH / d;
-        this.x += -s * (dx / d) + (tx0 - this.x) * BG_SPRING;
-        this.y += -s * (dy / d) + (ty0 - this.y) * BG_SPRING;
 
-        this.p[2] = (0.11 * s * s + 0.70) * Math.max(0.25, this.v);
+        // speed not used for text
+        this.p[4] = 0.0;
+      } else {
+        const inf = influence(d, INTERACT_RADIUS_BG);
+        this.hoverT = inf;
+
+        const inv = 1.0 / d;
+        let push = BG_REPEL_STRENGTH * inf;
+        if (push > MAX_PUSH_BG) push = MAX_PUSH_BG;
+
+        const px = -push * dx * inv;
+        const py = -push * dy * inv;
+
+        this.x += px + (tx0 - this.x) * BG_SPRING;
+        this.y += py + (ty0 - this.y) * BG_SPRING;
+
+        // --- NEW: compute bg speed01 from velocity (smoothed) ---
+        const vx = this.x - this.prevX;
+        const vy = this.y - this.prevY;
+        this.prevX = this.x;
+        this.prevY = this.y;
+
+        const spd = Math.sqrt(vx * vx + vy * vy); // px / frame
+        const target01 = Math.max(0, Math.min(1, spd / BG_SPEED_REF_PX_PER_FRAME));
+        this.spd01 += (target01 - this.spd01) * BG_SPEED_SMOOTH;
+
+        // Base size (as before) ...
+        const baseSize = (0.70 + 0.85 * inf) * Math.max(0.25, this.v);
+
+        // ... and NEW speed-based size boost (subtle)
+        const boostedSize = baseSize * (1.0 + this.spd01 * BG_SPEED_SIZE_BOOST);
+        this.p[2] = boostedSize;
+
+        // Send speed01 to shader so alpha can brighten
+        this.p[4] = this.spd01;
       }
+
+      // smooth hover + encode into w
+      this.hover += (this.hoverT - this.hover) * HOVER_LERP;
+      if (this.hover < 0) this.hover = 0;
+      else if (this.hover > 1) this.hover = 1;
+
+      this.p[3] = (this.mode === "text" ? 0.5 : 0.0) + this.hover * 0.49;
 
       this.p[0] = this.x;
       this.p[1] = this.y;
 
-      // When fully faded, switch back to background if near BG anchor
       if (this.mode === "text" && this.v < 0.02) {
         const a = this.bgAnchorForGrid(tmpXY);
         const ddx = this.x0 - a.x;
@@ -373,7 +488,6 @@
     }
   }
 
-  // shared temp object to avoid tiny allocations
   const tmpXY = { x: 0, y: 0 };
 
   // =========================
@@ -391,9 +505,13 @@
 
   gl.uniform1f(canvas.uBgAlpha, BG_ALPHA);
   gl.uniform1f(canvas.uTextAlpha, TEXT_ALPHA);
+  gl.uniform1f(canvas.uBgSpeedAlphaBoost, BG_SPEED_ALPHA_BOOST); // NEW
 
+  // attributes
   const aPosition = gl.getAttribLocation(canvas.program, "aPosition");
+  const aSpeed = gl.getAttribLocation(canvas.program, "aSpeed"); // NEW
   gl.enableVertexAttribArray(aPosition);
+  gl.enableVertexAttribArray(aSpeed);
 
   const positionBuffer = gl.createBuffer();
 
@@ -433,7 +551,6 @@
   let backCount = 0;
 
   function downsampleFlatXYInPlace(arr, maxPoints) {
-    // arr length is 2*points
     const points = (arr.length / 2) | 0;
     if (points <= maxPoints) return;
 
@@ -486,7 +603,6 @@
 
       if (!this.ctx) this.ctx = this.c.getContext("2d", { willReadFrequently: true });
 
-      // Resize only if needed
       if (this.w !== w || this.h !== h || this.dpr !== dpr) {
         this.dpr = dpr;
         this.w = this.c.width = w;
@@ -517,7 +633,6 @@
     raster.ensure();
     const { ctx, dpr, w, h } = raster;
 
-    // CSS px drawing space
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -560,13 +675,11 @@
       }
     }
 
-    // Read pixels (DPR space)
     const img = ctx.getImageData(0, 0, w, h).data;
 
     outFlatTargets.length = 0;
 
     const step = Math.max(1, Math.round(TEXT_SAMPLE_STEP * dpr));
-    // Store as CSS px positions
     for (let py = 0; py < h; py += step) {
       const row = py * w * 4;
       for (let px = 0; px < w; px += step) {
@@ -616,7 +729,6 @@
         tmpFlatTargets
       );
 
-      // append tmp -> menuTargets
       for (let j = 0; j < tmpFlatTargets.length; j++) menuTargets.push(tmpFlatTargets[j]);
     }
 
@@ -714,7 +826,6 @@
     }
   }
 
-  // temp scratch target buffer (flat)
   const tmpFlatTargets = [];
 
   // =========================
@@ -738,8 +849,6 @@
   }
 
   function fadeSectionTextBackToBG() {
-    // In your original code this starts fade at headingCount and includes body+back
-    // Keep identical behavior.
     fadeOutRangeInShuffle(headingCount, bodyCount + backCount);
   }
 
@@ -805,9 +914,9 @@
   function handleResize() {
     canvas.resize();
 
-    // refresh uniforms
     gl.uniform1f(canvas.uBgAlpha, BG_ALPHA);
     gl.uniform1f(canvas.uTextAlpha, TEXT_ALPHA);
+    gl.uniform1f(canvas.uBgSpeedAlphaBoost, BG_SPEED_ALPHA_BOOST);
 
     if (state === "section") setBackButtonFixedPosition();
     if (state === "section") applySectionLayout(activeKey, true);
@@ -824,6 +933,7 @@
 
   gl.uniform1f(canvas.uBgAlpha, BG_ALPHA);
   gl.uniform1f(canvas.uTextAlpha, TEXT_ALPHA);
+  gl.uniform1f(canvas.uBgSpeedAlphaBoost, BG_SPEED_ALPHA_BOOST);
 
   applyMenuLayout(true);
 
@@ -832,7 +942,16 @@
   // =========================
   function draw() {
     gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-    gl.vertexAttribPointer(aPosition, 4, gl.FLOAT, false, 0, 0);
+
+    // Interleaved buffer: [x,y,size,w,speed] = 5 floats
+    const strideBytes = STRIDE * 4;
+
+    // aPosition: vec4 at offset 0
+    gl.vertexAttribPointer(aPosition, 4, gl.FLOAT, false, strideBytes, 0);
+
+    // aSpeed: float at offset 16 bytes (4 floats * 4 bytes)
+    gl.vertexAttribPointer(aSpeed, 1, gl.FLOAT, false, strideBytes, 16);
+
     gl.bufferData(gl.ARRAY_BUFFER, packed, gl.DYNAMIC_DRAW);
     gl.drawArrays(gl.POINTS, 0, N_PARTICLES);
   }
@@ -840,9 +959,7 @@
   function loop(now) {
     requestAnimationFrame(loop);
     stepDOMTracking();
-
     for (let i = 0; i < N_PARTICLES; i++) particles[i].step(now);
-
     draw();
   }
 
